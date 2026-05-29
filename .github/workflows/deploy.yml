@@ -1,0 +1,88 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      - name: Terraform init
+        working-directory: infrastructure
+        run: terraform init
+
+      - name: Terraform apply
+        working-directory: infrastructure
+        env:
+          TF_VAR_db_password: ${{ secrets.TF_VAR_DB_PASSWORD }}
+          TF_VAR_ec2_key_pair_name: ${{ secrets.TF_VAR_EC2_KEY_PAIR_NAME }}
+        run: terraform apply -auto-approve
+
+  deploy:
+    needs: infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/nutrition-tracker:$IMAGE_TAG ./backend
+          docker tag $ECR_REGISTRY/nutrition-tracker:$IMAGE_TAG $ECR_REGISTRY/nutrition-tracker:latest
+          docker push $ECR_REGISTRY/nutrition-tracker:$IMAGE_TAG
+          docker push $ECR_REGISTRY/nutrition-tracker:latest
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: ECR_REGISTRY
+          script: |
+            aws ecr get-login-password --region eu-central-1 | \
+              docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            docker pull $ECR_REGISTRY/nutrition-tracker:latest
+
+            docker stop nutrition-tracker 2>/dev/null || true
+            docker rm nutrition-tracker 2>/dev/null || true
+
+            docker run -d \
+              --name nutrition-tracker \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              --env-file /home/ec2-user/.env \
+              $ECR_REGISTRY/nutrition-tracker:latest
